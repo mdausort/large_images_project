@@ -16,7 +16,7 @@ file = """#!/bin/bash\n\
 #SBATCH --output='/CECI/home/users/m/d/mdausort/Cytology/slurm/slurmJob_{a4}_{a3}_{a5}_{a8}.out'\n\
 #SBATCH --error='/CECI/home/users/m/d/mdausort/Cytology/slurm/slurmJob_{a4}_{a3}_{a5}_{a8}.err'\n\
 
-python3 train.py -com {a1} --num_epochs {a2} -m {a3} --wandb_b --model {a4} --lr {a5} --name_run test_{a4}_{a3}_{a5}_{a8} --freezed_bb {a7}
+python3 train.py -com {a1} --num_epochs {a2} -m {a3} --wandb_b --model {a4} --lr {a5} --name_run test_{a4}_{a3}_{a5}_{a8} --freezed_bb {a7} -pw {a9} -ph {a10}
 """
 
 if __name__=="__main__":
@@ -29,6 +29,8 @@ if __name__=="__main__":
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--bs", type=int, default=64)
     parser.add_argument('--freezed_bb', type=int, default=1)
+    parser.add_argument('--pw', type=int, default=416)
+    parser.add_argument('--ph', type=int, default=416)
     
     parser.add_argument("--model_name",type=str, default="vgg16")
     
@@ -38,8 +40,10 @@ if __name__=="__main__":
         freezed_backbone = 'fz_bb'
     else:
         freezed_backbone = 'ft_bb'
+        
+    path = "/CECI/home/users/m/d/mdausort/Cytology/slurm/"
     
-    with open("/CECI/home/users/m/d/mdausort/Cytology/slurm/submit_" + args.model_name + "_" + str(args.m) + "_" + str(args.lr) + "_" + freezed_backbone + ".sh","w") as writer:
+    with open(path + "submit_" + args.model_name + "_" + str(args.pw) + "_" + str(args.ph) + "_" + str(args.m) + "_" + str(args.lr) + "_" + freezed_backbone + ".sh","w") as writer:
         writer.write(file.format(a1=args.com, 
                                  a2=args.num_epochs,
                                  a3=args.m,
@@ -47,7 +51,9 @@ if __name__=="__main__":
                                  a5=args.lr,
                                  a6=args.bs, 
                                  a7=args.freezed_bb, 
-                                 a8=freezed_backbone))
+                                 a8=freezed_backbone,
+                                 a9=args.pw,
+                                 a10=args.ph))
         writer.close()
     
-    os.system("sbatch /CECI/home/users/m/d/mdausort/Cytology/slurm/submit_" + args.model_name + "_" + str(args.m) + "_" + str(args.lr) + "_" + freezed_backbone + ".sh")
+    os.system("sbatch " + path + "submit_" + args.model_name + "_" + str(args.pw) + "_" + str(args.ph) + "_" + str(args.m) + "_" + str(args.lr) + "_" + freezed_backbone + ".sh")
