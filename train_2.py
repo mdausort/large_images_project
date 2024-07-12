@@ -1,4 +1,3 @@
-
 import os
 import sys
 import wandb
@@ -132,21 +131,70 @@ class DBTADataset(Dataset):
         return image_patch, class_
 
 
-def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, lr,
+class FeaturesDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feature = torch.tensor(self.features[idx], dtype=torch.float)
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+
+        return feature, label
+
+
+def save_features_to_csv(model, data_loader, device, output_file):
+    model.eval()
+    features = []
+    labels = []
+
+    with torch.no_grad():
+        for inputs, label in tqdm(data_loader, unit='batches', total=len(data_loader)):
+            inputs = inputs.to(device)
+            label = label.to(device)
+            feature = model(inputs).cpu().numpy()
+            features.append(feature)
+            labels.append(label.cpu().numpy())
+
+    # print(features.shape)
+    features = np.concatenate(features)
+    if len(features.shape) > 2:
+        features = features.reshape(features.shape[0], features.shape[1])
+
+    labels = np.concatenate(labels)
+    if len(labels.shape) > 2:
+        labels = labels.reshape(labels.shape[0], labels.shape[1])
+
+    df = pd.DataFrame(features)
+    df['label'] = labels
+    df.to_csv(output_file, index=False)
+
+
+def load_features_from_csv(csv_file):
+    data = pd.read_csv(csv_file)
+    labels = data.pop('label').values
+    features = data.values
+
+    return features, labels
+
+
+def train(patch_w, patch_h, condition, stride_percent, magnification, model, name_run, bs, lr,
           num_epochs, momentum, freezed_bb, val_frequency, comment, wandb_b, patients=None):
 
     if thyroid:
-        PATH_DATA = '/CECI/home/users/m/d/mdausort/Cytology/'
-        data_dir = os.path.join(PATH_DATA, 'Training/')
+        path_data = '/CECI/home/users/m/d/mdausort/Cytology/'
+        data_dir = os.path.join(path_data, 'Dataset/')
 
-        annotation_file = 'annotation_patches_' + str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification)
+        annotation_file = 'annotation_patches_' + str(condition) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification)
         name_project = 'proof_of_concept_cyto'
     else:
-        PATH_DATA = '/CECI/home/users/t/g/tgodelai/'
-        data_dir = os.path.join(PATH_DATA, 'tl/data/')
+        path_data = '/CECI/home/users/t/g/tgodelai/'
+        data_dir = os.path.join(path_data, 'tl/data/')
 
-        annotation_file = 'annotation_patches_' + str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
-        # name_run = str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
+        annotation_file = 'annotation_patches_' + str(condition) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
         name_project = 'test_training_with_patches'
 
     # Initialize wandb
@@ -154,6 +202,7 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
         wandb.init(project=name_project, name=name_run)
         config = wandb.config
         config.patch_size = (patch_w, patch_h)
+        config.condition = condition
         config.stride = stride_percent
         config.magnification = magnification
         config.comment = comment
@@ -167,20 +216,20 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
     # Define transformations
     transform = transforms.Compose([
         transforms.ToTensor(),
-        # transforms.RandomHorizontalFlip(p=0.5),
-        # transforms.RandomVerticalFlip(p=0.5),
-        # transforms.RandomChoice([
-        #     transforms.RandomRotation(degrees=(0, 0)),
-        #     transforms.RandomRotation(degrees=(90, 90)),
-        #     transforms.RandomRotation(degrees=(180, 180)),
-        #     transforms.RandomRotation(degrees=(270, 270))
-        # ])
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomChoice([
+            transforms.RandomRotation(degrees=(0, 0)),
+            transforms.RandomRotation(degrees=(90, 90)),
+            transforms.RandomRotation(degrees=(180, 180)),
+            transforms.RandomRotation(degrees=(270, 270))
+        ])
     ])
 
     # Create datasets and dataloaders
     if thyroid:
-        train_dataset = ThyroidDataset(data_dir, annotation_file + '_train.csv', magnification, transform)
-        val_dataset = ThyroidDataset(data_dir, annotation_file + '_val.csv', magnification, transform)
+        train_dataset = ThyroidDataset(data_dir, 'Annotations/' + annotation_file + '_train.csv', magnification, transform)
+        val_dataset = ThyroidDataset(data_dir, 'Annotations/' + annotation_file + '_val.csv', magnification, transform)
     else:
         train_dataset = DBTADataset(data_dir, annotation_file + '_train.csv', magnification, transform)
         val_dataset = DBTADataset(data_dir, annotation_file + '_val.csv', magnification, transform)
@@ -190,66 +239,52 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
 
     num_classes = len(train_dataset.classes)
 
-    if freezed_bb == 1:
-        fz_bb = False  # Freezed backbone and only the classifier layer
-    else:
-        fz_bb = True  # Changing backbone and only the classifier layer
-
-    # Load the pre-trained model
     if model == 'vgg16':
-        model_used = models.vgg16(weights='IMAGENET1K_V1')
-        model_used.classifier[6] = nn.Linear(model_used.classifier[6].in_features, num_classes)
-
-        # Freeze all the layer except linear layer to finetune only the classifier layer
-        for param in model_used.parameters():
-            param.requires_grad = fz_bb
-        for param in model_used.classifier[6].parameters():
-            param.requires_grad = True
-
+        base_model = models.vgg16(weights='IMAGENET1K_V1').features
+        # model_used = models.vgg16(weights='IMAGENET1K_V1')
+        # model_used.classifier[6] = nn.Linear(model_used.classifier[6].in_features, num_classes)
     elif model == 'resnet50':
-        model_used = models.resnet50(weights='IMAGENET1K_V1')
-        model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
-        # Freeze all the layer except linear layer to finetune only the classifier layer
-        for param in model_used.parameters():
-            param.requires_grad = fz_bb
-        for param in model_used.fc.parameters():
-            param.requires_grad = True
-
+        base_model = nn.Sequential(*list(models.resnet50(weights='IMAGENET1K_V1').children())[:-1])
+        # model_used = models.resnet50(weights='IMAGENET1K_V1')
+        # model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
     elif model == 'resnet18':
-        model_used = models.resnet18(weights='IMAGENET1K_V1')
-        model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
-        # Freeze all the layer except linear layer to finetune only the classifier layer
-        for param in model_used.parameters():
-            param.requires_grad = fz_bb
-        for param in model_used.fc.parameters():
-            param.requires_grad = True
-
+        base_model = nn.Sequential(*list(models.resnet18(weights='IMAGENET1K_V1').children())[:-1])
+        # model_used = models.resnet18(weights='IMAGENET1K_V1')
+        # model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
     else:
         print('Model name is incorrect.')
+        return
 
-    visualize = False
-    if visualize:
-        for name, layer in model_used.named_modules():
-            print(name, layer)
-            print(' ')
-
-    # Move the model to the GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(device)
-    model_used = model_used.to(device)
+    base_model = base_model.to(device)
 
-    # Set loss function and optimizer
+    features_csv = os.path.join(data_dir + 'Features/', 'features_' + str(condition) + '_' + str(model) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '.csv')
+    features_csv_val = os.path.join(data_dir + 'Features/', 'features_val_' + str(condition) + '_' + str(model) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '.csv')
+
+    if not os.path.exists(features_csv):
+        save_features_to_csv(base_model, train_loader, device, features_csv)
+    if not os.path.exists(features_csv_val):
+        save_features_to_csv(base_model, val_loader, device, features_csv_val)
+
+    features, labels = load_features_from_csv(features_csv)
+    features_train_dataset = FeaturesDataset(features, labels)
+    train_loader = DataLoader(features_train_dataset, batch_size=bs, shuffle=False, num_workers=8)
+
+    features_val, labels_val = load_features_from_csv(features_csv_val)
+    features_train_dataset_val = FeaturesDataset(features_val, labels_val)
+    val_loader = DataLoader(features_train_dataset_val, batch_size=bs, shuffle=False, num_workers=8)
+
+    model_linear = nn.Sequential(nn.Linear(features.shape[1], 128), nn.ReLU(), nn.Linear(128, num_classes)).to(device)
+
+    optimizer = optim.SGD(model_linear.parameters(), lr=lr, momentum=momentum)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model_used.parameters(), lr=lr, momentum=momentum)
 
     best_epoch_acc = 0.
-    # Training loop
     for epoch in range(num_epochs):
         print(f'Epoch {epoch+1}/{num_epochs}')
         print('-' * 10)
 
-        # Train phase
-        model_used.train()
+        model_linear.train()
         running_loss = 0.0
         running_corrects = 0
 
@@ -260,7 +295,7 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
             optimizer.zero_grad()
 
             with torch.set_grad_enabled(True):
-                outputs = model_used(inputs)
+                outputs = model_linear(inputs)
                 loss = criterion(outputs, labels)
                 _, preds = torch.max(outputs, 1)
 
@@ -270,23 +305,16 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
             running_loss += loss.item() * inputs.size(0)
             running_corrects += torch.sum(preds == labels.data)
 
-            if batch % (len(train_loader) // 3) == 0 or batch == len(train_loader) - 1:
-                epoch_loss = running_loss / len(train_loader.dataset)
-                epoch_acc = running_corrects.double() / len(train_loader.dataset)
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_acc = running_corrects.double() / len(train_loader.dataset)
 
-                # Log metrics to wandb
-                if wandb_b:
-                    wandb.log({"train_loss": epoch_loss, "train_accuracy": epoch_acc})
-
-                running_loss = 0.0
-                running_corrects = 0
+        if wandb_b:
+            wandb.log({"train_loss": epoch_loss, "train_accuracy": epoch_acc})
 
         print(f"Train loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
 
-        # Validation phase
         if (epoch + 1) % val_frequency == 0:
-
-            model_used.eval()
+            model_linear.eval()
             running_loss = 0.0
             running_corrects = 0
 
@@ -295,7 +323,7 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
                 labels = labels.to(device)
 
                 with torch.set_grad_enabled(False):
-                    outputs = model_used(inputs)
+                    outputs = model_linear(inputs)
                     loss = criterion(outputs, labels)
                     _, preds = torch.max(outputs, 1)
 
@@ -307,9 +335,8 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
 
             if best_epoch_acc < epoch_acc:
                 best_epoch_acc = epoch_acc
-                torch.save(model_used.state_dict(), os.join(PATH_DATA, name_run + '_best_epoch_weights.pth'))
+                torch.save(model_linear.state_dict(), os.path.join(path_data + 'Train/', name_run + '_best_epoch_weights.pth'))
 
-            # Log metrics to wandb
             if wandb_b:
                 wandb.log({"val_loss": epoch_loss, "val_accuracy": epoch_acc})
 
@@ -318,32 +345,30 @@ def train(patch_w, patch_h, stride_percent, magnification, model, name_run, bs, 
     print("Training complete")
 
     if wandb_b:
-        wandb.save(os.join(PATH_DATA, name_run + '_best_epoch_weights.pth'))
+        wandb.save(os.path.join(path_data + 'Train/', name_run + '_best_epoch_weights.pth'))
         wandb.finish()
 
 
-def test(patch_w, patch_h, stride_percent, magnification, model, name_run,
+def test(patch_w, patch_h, condition, stride_percent, magnification, model, name_run,
          bs, lr, comment, patients=None):
 
     if thyroid:
-        PATH_DATA = '/CECI/home/users/m/d/mdausort/Cytology/'
-        data_dir = os.path.join(PATH_DATA, 'Training/')
+        path_data = '/CECI/home/users/m/d/mdausort/Cytology/'
+        data_dir = os.path.join(path_data, 'Dataset/')
 
-        annotation_file = 'annotation_patches_' + str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification)
+        annotation_file = 'annotation_patches_' + str(condition) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification)
         name_project = 'proof_of_concept_cyto'
     else:
-        PATH_DATA = '/CECI/home/users/t/g/tgodelai/'
-        data_dir = os.path.join(PATH_DATA, 'tl/data/')
+        path_data = '/CECI/home/users/t/g/tgodelai/'
+        data_dir = os.path.join(path_data, 'tl/data/')
 
-        annotation_file = 'annotation_patches_' + str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
-        # name_run = str(patch_w) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
+        annotation_file = 'annotation_patches_' + str(condition) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '_' + ''.join(patients)
         name_project = 'test_training_with_patches'
 
     transform = transforms.Compose([
         transforms.ToTensor()
     ])
 
-    # Create datasets and dataloaders
     if thyroid:
         test_dataset = ThyroidDataset(data_dir, annotation_file + '_test.csv', magnification, transform)
     else:
@@ -353,28 +378,41 @@ def test(patch_w, patch_h, stride_percent, magnification, model, name_run,
 
     num_classes = len(test_dataset.classes)
 
-    # Load the pre-trained model
     if model == 'vgg16':
-        model_used = models.vgg16(weights='IMAGENET1K_V1')
-        model_used.classifier[6] = nn.Linear(model_used.classifier[6].in_features, num_classes)
+        base_model = models.vgg16(weights='IMAGENET1K_V1').features
+        # model_used = models.vgg16(weights='IMAGENET1K_V1')
+        # model_used.classifier[6] = nn.Linear(model_used.classifier[6].in_features, num_classes)
     elif model == 'resnet50':
-        model_used = models.resnet50(weights='IMAGENET1K_V1')
-        model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
+        base_model = nn.Sequential(*list(models.resnet50(weights='IMAGENET1K_V1').children())[:-1])
+        # model_used = models.resnet50(weights='IMAGENET1K_V1')
+        # model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
     elif model == 'resnet18':
-        model_used = models.resnet18(weights='IMAGENET1K_V1')
-        model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
+        base_model = nn.Sequential(*list(models.resnet18(weights='IMAGENET1K_V1').children())[:-1])
+        # model_used = models.resnet18(weights='IMAGENET1K_V1')
+        # model_used.fc = nn.Linear(model_used.fc.in_features, num_classes)
     else:
         print('Model name is incorrect.')
+        return
 
-    # Move the model to the GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_used = model_used.to(device)
+    base_model = base_model.to(device)
+
+    features_csv_test = os.path.join(data_dir + 'Features/', 'features_test_' + str(condition) + '_' + str(model) + '_' + str(patch_h) + '_' + str(stride_percent) + '_' + str(magnification) + '.csv')
+
+    if not os.path.exists(features_csv_test):
+        save_features_to_csv(base_model, test_loader, device, features_csv_test)
+
+    features, labels = load_features_from_csv(features_csv_test)
+    features_test_dataset = FeaturesDataset(features, labels)
+    test_loader = DataLoader(features_test_dataset, batch_size=bs, shuffle=False, num_workers=8)
+
+    model_linear = nn.Sequential(nn.Linear(features.shape[1], 128), nn.ReLU(), nn.Linear(128, num_classes)).to(device)
 
     # Load the best model weights
-    model_used.load_state_dict(torch.load(os.join(PATH_DATA, name_run, 'best_epoch_weights.pth')))
+    model_linear.load_state_dict(torch.load(os.join(path_data, name_run, 'best_epoch_weights.pth')))
 
     # Set model to evaluation mode
-    model_used.eval()
+    model_linear.eval()
 
     # Testing loop
     all_labels = []
@@ -391,7 +429,7 @@ def test(patch_w, patch_h, stride_percent, magnification, model, name_run,
         labels = labels.to(device)
 
         with torch.no_grad():
-            outputs = model_used(inputs)
+            outputs = model_linear(inputs)
             loss = criterion(outputs, labels)
             _, preds = torch.max(outputs, 1)
 
@@ -443,7 +481,7 @@ def test(patch_w, patch_h, stride_percent, magnification, model, name_run,
 
     # Save as PNG
     plt.tight_layout()
-    plt.savefig(PATH_DATA + 'Testing/confusion_matrix.svg')
+    plt.savefig(path_data + 'Test/confusion_matrix.svg')
 
     # Identify worst predictions (incorrect predictions with the highest confidence)
     prediction_errors = []
@@ -470,7 +508,7 @@ def test(patch_w, patch_h, stride_percent, magnification, model, name_run,
         axes[idx].axis('off')
 
     plt.tight_layout()
-    plt.savefig(PATH_DATA + 'Testing/ten_worst_predictions.svg')
+    plt.savefig(path_data + 'Test/ten_worst_predictions.svg')
 
 
 # %% Parser and launch run
@@ -480,12 +518,13 @@ def parse_arguments():
     # Properties of the annotation file
     parser.add_argument('-pw', '--patch_w', type=int, default=416, help='Width of the patch')
     parser.add_argument('-ph', '--patch_h', type=int, default=416, help='Height of the patch')
+    parser.add_argument('--condition', type=str, choices=['mean', 'variance'], help='Condition to choose patches')
     parser.add_argument('-sp', '--stride_percent', type=float, default=1.0, help='Stride percentage')
     parser.add_argument('-m', '--magnification', type=float, default=20, help='Magnification level')
     parser.add_argument("-p", "--patients", type=str, default=None, choices=[None, 'adult', 'child'], help="Patient identifier")
 
     # Properties of the model
-    parser.add_argument('--model', type=str, choices=['resnet50', 'vgg16'], help='Name of the model')
+    parser.add_argument('--model', type=str, choices=['resnet50', 'resnet18', 'vgg16'], help='Name of the model')
     parser.add_argument('--bs', type=int, default=64, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
@@ -506,7 +545,7 @@ if __name__ == '__main__':
     args = parse_arguments()
 
     if args.task == 'train':
-        train(args.patch_w, args.patch_h, args.stride_percent, args.magnification, args.model, args.name_run,
+        train(args.patch_w, args.patch_h, args.condition, args.stride_percent, args.magnification, args.model, args.name_run,
               args.bs, args.lr, args.num_epochs, args.momentum, args.freezed_bb, args.val_frequency, args.comment, args.wandb_b, args.patients)
     elif args.task == 'test':
         test(args.patch_w, args.patch_h, args.stride_percent, args.magnification, args.model, args.name_run,

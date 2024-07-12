@@ -1,51 +1,81 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jun  6 11:44:36 2024
+import os
+import cv2
+import sys
+import csv
+import argparse
+import numpy as np
+import pandas as pd
 
-@author: tgodelaine
-"""
+thyroid = True
+cluster = True
+
+if cluster:
+    if thyroid:
+        sys.path.insert(0, '/auto/home/users/m/d/mdausort/Software/large_image_source_tifffile')
+    else:
+        print('No need of the modified package for the moment in the brain project.')
+        # sys.path.insert(0, '/CECI/home/t/g/tgodelai/large_image_source_tifffile')
+elif not cluster:
+    if thyroid:
+        sys.path.insert(0, 'C:/Users/dausort/OneDrive - UCL/Bureau/large_image_source_tifffile')
+    else:
+        print('No need of the modified package for the moment in the brain project.')
+        # sys.path.insert(0, 'C:/Users/tgodelaine/large_image_source_tifffile')
 
 import large_image
-import pandas as pd
-import os
-import tifffile
-import zarr
-import csv
-import numpy as np
-import matplotlib.pyplot as plt
-import argparse
 
-import sys
-sys.path.insert(0, '/auto/home/users/m/d/mdausort/Software/large_image_source_tifffile')
+def convert_to_grayscale(image):
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+def calculate_mean(image):
+    return np.mean(image)
 
-def create_patches(image_path, patch_w, patch_h, stride_percent, magnification):
+def calculate_median(image):
+    return np.median(image[:, :, :3], axis=(0, 1))
+
+def calculate_variance(image):
+    return np.var(image)
+
+def detect_edges(image):
+    edges = cv2.Canny(image, 100, 200)
+    return edges, np.sum(edges)
+
+def create_patches(image_path, patch_w, patch_h, stride_percent, magnification, condition):
 
     image_slide = large_image.getTileSource(image_path)
     xc, yc = [], []
 
     for slide_info in image_slide.tileIterator(
-
             scale=dict(magnification=magnification),
             tile_size=dict(width=patch_w, height=patch_w),
             tile_overlap=dict(x=0, y=0),
             format=large_image.tilesource.TILE_FORMAT_NUMPY):
 
         im_tile = np.array(slide_info['tile'])
-        tile_mean_rgb = np.mean(im_tile[:, :, :3], axis=(0, 1))
+        grey_tile = convert_to_grayscale(im_tile)
 
-        if np.mean(tile_mean_rgb) < 220. and im_tile.shape == (patch_w, patch_h, 3):
-            xc.append(slide_info["x"])
-            yc.append(slide_info["y"])
+        if condition == 'mean' and im_tile.shape == (patch_w, patch_h, 3):
+            mean_im_tile = np.mean(im_tile[:, :, :3], axis=(0, 1))
+            if calculate_mean(mean_im_tile) < 220.:
+                xc.append(slide_info["x"])
+                yc.append(slide_info["y"])
+
+        elif condition == 'variance' and im_tile.shape == (patch_w, patch_h, 3):
+            if calculate_variance(grey_tile) > 1500. and detect_edges(grey_tile)[1] > 50000.:
+                xc.append(slide_info["x"])
+                yc.append(slide_info["y"])
+
+        # if np.mean(tile_mean_rgb) < 220. and im_tile.shape == (patch_w, patch_h, 3):
+        #     xc.append(slide_info["x"])
+        #     yc.append(slide_info["y"])
 
     return xc, yc
 
 
-def create_annotation_csv_file(csv_dir, images_dir, patch_w, patch_h, stride_percent, magnification, set_percent=[0.7, 0.1, 0.2]):
-    csv_path = os.path.join(csv_dir, 'annotation_patches_' + str(patch_w) + '_' + str(patch_h)
-                            + '_' + str(stride_percent)
-                            + '_' + str(magnification) + '.csv')
+def create_annotation_csv_file(csv_dir, images_dir, patch_w, patch_h, stride_percent, magnification, condition, set_percent=[0.7, 0.1, 0.2]):
+
+    csv_path = os.path.join(csv_dir, 'annotation_patches_' + str(condition) + '_' + str(patch_h)
+                            + '_' + str(stride_percent) + '_' + str(magnification) + '.csv')
 
     header = ['uuid', 'xc', 'yc', 'w', 'h', 'diagnosis']
 
@@ -62,7 +92,7 @@ def create_annotation_csv_file(csv_dir, images_dir, patch_w, patch_h, stride_per
             image_path = os.path.join(images_dir, image)
             idx = df.index[df['uuid'] == image.split('.ndpi')[0]].tolist()
 
-            xc, yc = create_patches(image_path, patch_w, patch_h, stride_percent, magnification)
+            xc, yc = create_patches(image_path, patch_w, patch_h, stride_percent, magnification, condition)
 
             diagnosis = df.loc[idx, 'diagnosis']
 
@@ -78,11 +108,11 @@ def create_annotation_csv_file(csv_dir, images_dir, patch_w, patch_h, stride_per
 
     diagnosis_df = sorted_df['diagnosis']
 
+    set_percent = [0.7, 0.1, 0.2]
+
     train_df = pd.DataFrame({})
     val_df = pd.DataFrame({})
     test_df = pd.DataFrame({})
-
-    set_percent = [0.7, 0.1, 0.2]
 
     for i, c in enumerate(classes):
         df_c = sorted_df[diagnosis_df == c]
@@ -107,6 +137,7 @@ def parse_arguments():
     parser.add_argument("-ph", "--patch_h", type=int, default=416, help="Height of the patch")
     parser.add_argument("-sp", "--stride_percent", type=float, default=1.0, help="Stride percentage")
     parser.add_argument("-m", "--magnification", type=float, default=20, help="Magnification level")
+    parser.add_argument('--condition', type=str, choices=['mean', 'variance'])
     parser.add_argument("--set_percent", type=float, nargs='+', default=[0.7, 0.1, 0.2], help="Distribution percentage")
 
     args = parser.parse_args()
@@ -115,6 +146,6 @@ def parse_arguments():
 
 if __name__ == '__main__':
     args = parse_arguments()
-    create_annotation_csv_file(args.csv_dir, args.images_dir,
-                               args.patch_w, args.patch_h, args.stride_percent, args.magnification,
-                               args.set_percent)
+    create_annotation_csv_file(args.csv_dir, args.images_dir, args.patch_w,
+                               args.patch_h, args.stride_percent, args.magnification,
+                               args.condition, args.set_percent)
